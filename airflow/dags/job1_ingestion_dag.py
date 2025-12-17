@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import os
 from datetime import timedelta
-
+import pendulum
 from airflow import DAG
 from airflow.decorators import task
-from airflow.utils.dates import days_ago
+import sys
+# from airflow.utils.dates import days_ago
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+SRC_PATH = os.path.join(PROJECT_ROOT, "src")
+
+if SRC_PATH not in sys.path:
+    sys.path.insert(0, SRC_PATH)
 
 
 # --- Config via env (safe for GitHub) ---
@@ -21,7 +28,7 @@ RUN_SECONDS = int(os.getenv("RUN_SECONDS", "3600"))          # run for 1 hour pe
 with DAG(
     dag_id="job1_ingestion_api_to_kafka",
     description="Job 1: Pseudo-stream ingestion: API -> Kafka (raw JSON)",
-    start_date=days_ago(1),
+    start_date=pendulum.datetime(2025, 12, 17, tz="UTC"),
     schedule=None,  # trigger manually in UI (or via API); acts as long-running job
     catchup=False,
     max_active_runs=1,
@@ -36,8 +43,9 @@ with DAG(
     @task
     def produce_raw_events():
         # Import here so Airflow parsing doesn't require deps at parse-time
-        from src.job1_producer import run_producer_loop
-
+        from job1_producer import run_producer_loop
+        print("KAFKA_BOOTSTRAP=", os.getenv("KAFKA_BOOTSTRAP"), flush=True)
+        print("API_URL=", os.getenv("API_URL"), flush=True)
         run_producer_loop(
             api_url=API_URL,
             kafka_bootstrap=KAFKA_BOOTSTRAP,

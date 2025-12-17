@@ -2,11 +2,11 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-
 import pandas as pd
 from kafka import KafkaConsumer, TopicPartition
 
-from src.db_utils import init_db, sqlite_conn
+from db_utils import init_db, sqlite_conn
+
 
 
 def _utc_iso() -> str:
@@ -91,36 +91,36 @@ def _extract_rows_from_envelope(df_env: pd.DataFrame) -> pd.DataFrame:
 def _read_kafka_batch(
     kafka_bootstrap: str,
     topic: str,
-    group_id: str,
+    group_id: str,          # оставляем в сигнатуре, но не используем
     poll_ms: int = 5000,
     max_messages: int = 20000,
 ) -> tuple[list[dict], KafkaConsumer]:
-    """
-    Pull all available messages in this run (bounded by max_messages).
-    Returns (messages_as_dicts, consumer). We keep consumer open so we can commit after DB write.
-    """
     consumer = KafkaConsumer(
-        topic,
-        bootstrap_servers=kafka_bootstrap,
-        group_id=group_id,
-        enable_auto_commit=False,               # commit after successful SQLite write
-        auto_offset_reset="earliest",           # first run reads from start; later runs continue
+        bootstrap_servers=[kafka_bootstrap],
+        enable_auto_commit=False,
+        auto_offset_reset="earliest",
         value_deserializer=lambda v: json.loads(v.decode("utf-8")),
-        consumer_timeout_ms=2000,               # stop iteration when no messages
-        max_poll_records=5000,
+        consumer_timeout_ms=2000,
+        api_version=(2, 6, 0),   # у тебя broker 2.6 (видно в логах)
     )
+
+    # вручную назначаем partition 0
+    tp = TopicPartition(topic, 0)
+    consumer.assign([tp])
+    consumer.seek_to_beginning(tp)
 
     msgs: list[dict] = []
     try:
-        for m in consumer:
-            msgs.append(m.value)
-            if len(msgs) >= max_messages:
-                break
+        records = consumer.poll(timeout_ms=poll_ms)
+        for _, batch in records.items():
+            for m in batch:
+                msgs.append(m.value)
+                if len(msgs) >= max_messages:
+                    break
     except Exception as e:
-        print(f"[job2] kafka read error: {e}")
+        print(f"[job2] kafka read error: {e}", flush=True)
 
     return msgs, consumer
-
 
 def consume_clean_store_batch(
     kafka_bootstrap: str,
@@ -167,7 +167,8 @@ def consume_clean_store_batch(
 
     # Commit Kafka offsets ONLY after DB write succeeded
     try:
-        consumer.commit()
+        if consumer.config.get("group_id"):
+            consumer.commit()
     finally:
         consumer.close()
 

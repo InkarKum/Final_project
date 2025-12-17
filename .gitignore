@@ -1,0 +1,14 @@
+# Airflow runtime / DB / logs
+airflow/airflow.db*
+airflow/logs/
+airflow/__pycache__/
+**/__pycache__/
+
+# SQLite runtime files
+*.db
+*.db-wal
+*.db-shm
+
+# Python env
+.venv/
+.env

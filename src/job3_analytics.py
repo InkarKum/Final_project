@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
-
 import pandas as pd
 
-from src.db_utils import init_db, sqlite_conn, upsert_daily_summary_rows
+from db_utils import init_db, sqlite_conn, upsert_daily_summary_rows
 
 
 def _utc_iso() -> str:
