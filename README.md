@@ -40,12 +40,6 @@ project/
 6. **Requests** for API integration
 7. **Kafka-Python** for Kafka interaction
 
-To install all dependencies, run the following:
-
-```bash
-pip install -r requirements.txt
-```
-
 ## Setup
 
 ### 1. Kafka Setup
@@ -87,24 +81,6 @@ This DAG runs daily and computes analytical summaries from the cleaned data stor
 * **Flow:** SQLite (events) → Job 3 → Analytics → SQLite (daily_summary)
 
 The analytics task (`job3_analytics.py`) aggregates the data and stores daily summaries.
-
-## How to Run
-
-### 1. Start Apache Airflow:
-
-Ensure Apache Airflow is running. You can follow the official Airflow installation guide: [https://airflow.apache.org/docs/apache-airflow/stable/start/index.html](https://airflow.apache.org/docs/apache-airflow/stable/start/index.html)
-
-Trigger the DAGs from the Airflow UI or via the Airflow API.
-
-### 2. Run the Pipeline:
-
-Trigger the `job1_ingestion_dag.py` manually or let it run continuously.
-
-The other jobs (`job2_clean_store_dag.py` and `job3_daily_summary_dag.py`) will run according to their schedules.
-
-### 3. Monitor Logs:
-
-You can monitor the progress of each DAG in the Airflow UI. Logs for each task will show detailed information about data processing and errors (if any).
 
 ## SQLite Schema
 
