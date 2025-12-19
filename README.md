@@ -1,4 +1,4 @@
-# Real-time Data Ingestion and Analytics Pipeline
+# Real-time data ingestion and analytics pipeline - Final Project
 
 ## Overview
 This project implements a complete streaming and batch data pipeline using Apache Airflow, Kafka, and SQLite. The pipeline is designed to handle real-time data ingestion from an API, perform data cleaning, and produce daily analytics summaries. It uses three main Apache Airflow jobs (DAGs) to achieve this:
