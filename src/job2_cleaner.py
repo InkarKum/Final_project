@@ -1,127 +1,287 @@
 from __future__ import annotations
+
 import json
+import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any
+
 import pandas as pd
-from kafka import KafkaConsumer, TopicPartition
+from kafka import KafkaConsumer
 
 from db_utils import init_db, sqlite_conn
 
 
+# ------------------------
+# Target schema (ticker/24hr fields as columns)
+# ------------------------
+BASE_COLS = ["event_id", "source", "ingested_at", "symbol", "event_time"]
 
-def _utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+# Binance ticker/24hr typical fields:
+TICKER_COLS = [
+    "priceChange",
+    "priceChangePercent",
+    "weightedAvgPrice",
+    "prevClosePrice",
+    "lastPrice",
+    "lastQty",
+    "bidPrice",
+    "bidQty",
+    "askPrice",
+    "askQty",
+    "openPrice",
+    "highPrice",
+    "lowPrice",
+    "volume",
+    "quoteVolume",
+    "openTime",
+    "closeTime",
+    "firstId",
+    "lastId",
+    "count",
+]
+
+# For your existing table you also wanted "price" - we'll map lastPrice -> price
+# and keep lastPrice too (so you have both).
+FINAL_COLS = [
+    "event_id",
+    "symbol",
+    "price",        # derived from lastPrice
+    "event_time",
+    "source",
+    "ingested_at",
+] + TICKER_COLS
+
+FLOAT_COLS = [
+    "price",
+    "priceChange",
+    "priceChangePercent",
+    "weightedAvgPrice",
+    "prevClosePrice",
+    "lastPrice",
+    "lastQty",
+    "bidPrice",
+    "bidQty",
+    "askPrice",
+    "askQty",
+    "openPrice",
+    "highPrice",
+    "lowPrice",
+    "volume",
+    "quoteVolume",
+]
+INT_COLS = ["openTime", "closeTime", "firstId", "lastId", "count"]
 
 
+# ------------------------
+# Helpers
+# ------------------------
+def _ms_to_iso(ms: Any) -> str | None:
+    try:
+        if ms is None or (isinstance(ms, float) and pd.isna(ms)):
+            return None
+        return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+def _is_klines_payload(x: Any) -> bool:
+    return isinstance(x, list) and (len(x) == 0 or isinstance(x[0], list))
+
+
+def _is_ticker_payload(x: Any) -> bool:
+    return isinstance(x, dict) and ("symbol" in x) and ("lastPrice" in x or "priceChange" in x)
+
+
+def _ensure_columns_sqlite(conn, table: str, df: pd.DataFrame) -> None:
+    cur = conn.cursor()
+    existing = [r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()]
+    missing = [c for c in df.columns if c not in existing]
+
+    for c in missing:
+        if c in INT_COLS:
+            col_type = "INTEGER"
+        elif c in FLOAT_COLS:
+            col_type = "REAL"
+        else:
+            col_type = "TEXT"
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {c} {col_type}")
+
+    if missing:
+        conn.commit()
+
+
+def _finalize_and_clean(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=FINAL_COLS)
+
+    # Ensure all final cols exist
+    for c in FINAL_COLS:
+        if c not in df.columns:
+            df[c] = pd.NA
+
+    # Clean symbol
+    df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
+
+    # Convert numeric cols
+    for c in FLOAT_COLS:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    for c in INT_COLS:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+
+    # event_time must be ISO string
+    df["event_time"] = df["event_time"].astype(str)
+
+    # Basic validity
+    df = df.dropna(subset=["symbol", "price", "event_time"])
+    df = df[df["price"] > 0]
+
+    # Dedupe: keep unique event_id; also avoid same symbol+event_time duplicates
+    df = df.drop_duplicates(subset=["event_id"])
+    df = df.drop_duplicates(subset=["symbol", "event_time"])
+
+    return df[FINAL_COLS]
+
+
+# ------------------------
+# Extract
+# ------------------------
 def _extract_rows_from_envelope(df_env: pd.DataFrame) -> pd.DataFrame:
     """
-    Convert envelope(payload) -> flat rows with columns needed for events table.
-    Supports Binance endpoints like:
-      - /api/v3/ticker/price      -> {"symbol":"BTCUSDT","price":"123.45"}
-      - /api/v3/ticker/price      -> [ {...}, {...} ]
-      - /api/v3/ticker/24hr       -> dict or list (we will take symbol + lastPrice if present)
+    Input df_env columns: event_id, source, ingested_at, payload
+    For ticker payload (dict): flatten all keys into columns.
+    For klines: keep minimal (symbol, price, openTime->event_time) + empty ticker cols.
     """
-    # df_env columns: event_id, source, ingested_at, payload
-    payload_series = df_env["payload"]
+    if df_env.empty or "payload" not in df_env.columns:
+        return pd.DataFrame(columns=FINAL_COLS)
 
-    # Normalize payloads: each envelope may contain dict or list -> explode to rows
-    payload_df = pd.json_normalize(payload_series)
+    payload = df_env["payload"]
+    kl_mask = payload.apply(_is_klines_payload)
+    tk_mask = payload.apply(_is_ticker_payload)
 
-    # If payload is a list-of-dicts, json_normalize gives columns like 0.symbol ... not ideal.
-    # So handle list payloads explicitly:
-    is_list_mask = payload_series.apply(lambda x: isinstance(x, list))
-    if is_list_mask.any():
-        # Expand list payloads into separate rows
-        list_part = payload_series[is_list_mask].explode()
-        list_df = pd.json_normalize(list_part).reset_index(drop=True)
+    frames: list[pd.DataFrame] = []
 
-        # Non-list part
-        dict_part = payload_series[~is_list_mask]
-        dict_df = pd.json_normalize(dict_part).reset_index(drop=True)
+    # --- TICKER (dict) ---
+    if tk_mask.any():
+        dft = df_env[tk_mask].copy()
 
-        # Align with envelopes: repeat envelope rows for exploded lists
-        env_list = df_env[is_list_mask].loc[list_part.index].reset_index(drop=True)
-        env_list = env_list.loc[env_list.index.repeat(1)].reset_index(drop=True)
+        payload_df = pd.json_normalize(dft["payload"])
 
-        # Better: rebuild by repeating envelope rows exactly to explode length
-        # We can do this without Python loops by using group sizes:
-        sizes = df_env[is_list_mask]["payload"].apply(len).to_numpy()
-        env_rep = df_env[is_list_mask].loc[df_env[is_list_mask].index.repeat(sizes)].reset_index(drop=True)
-        payload_rep = pd.json_normalize(list_part.reset_index(drop=True))
-
-        df_list_final = pd.concat([env_rep[["event_id", "source", "ingested_at"]].reset_index(drop=True), payload_rep], axis=1)
-        df_dict_final = pd.concat([df_env[~is_list_mask][["event_id", "source", "ingested_at"]].reset_index(drop=True), dict_df], axis=1)
-
-        df_flat = pd.concat([df_dict_final, df_list_final], ignore_index=True)
-    else:
-        df_flat = pd.concat([df_env[["event_id", "source", "ingested_at"]].reset_index(drop=True), payload_df], axis=1)
-
-    # Map fields depending on endpoint
-    # Prefer 'price' if exists; else use 'lastPrice' (24hr endpoint)
-    df_flat = df_flat.rename(columns={"lastPrice": "price"})
-
-    # Binance sometimes returns numeric as strings -> cast with pandas
-    # Required columns
-    needed = ["event_id", "source", "ingested_at", "symbol", "price"]
-    # If symbol/price missing, produce empty frame with those columns
-    for col in ["symbol", "price"]:
-        if col not in df_flat.columns:
-            df_flat[col] = pd.NA
-
-    # Cleaning rules (Pandas only):
-    cleaned = (
-        df_flat[needed]
-        .dropna(subset=["symbol", "price"])                   # remove missing
-        .assign(
-            symbol=lambda x: x["symbol"].astype(str).str.upper().str.strip(),
-            price=lambda x: pd.to_numeric(x["price"], errors="coerce"),
-            event_time=lambda x: x["ingested_at"],            # event_time = ingestion time (simple & valid)
+        out = pd.concat(
+            [
+                dft[["event_id", "source", "ingested_at"]].reset_index(drop=True),
+                payload_df.reset_index(drop=True),
+            ],
+            axis=1,
         )
-        .dropna(subset=["price"])
-        .query("price > 0")                                   # filter invalid
-        .drop_duplicates(subset=["event_id"])
-        .drop_duplicates(subset=["symbol", "event_time"])      # avoid duplicates per tick time
-    )
 
-    # Keep final event columns
-    cleaned = cleaned[["event_id", "symbol", "price", "event_time", "source", "ingested_at"]]
-    return cleaned
+        # Derive price from lastPrice
+        if "lastPrice" in out.columns:
+            out["price"] = out["lastPrice"]
+        else:
+            out["price"] = pd.NA
+
+        # event_time from closeTime (preferred) else openTime else ingested_at
+        if "closeTime" in out.columns:
+            out["event_time"] = out["closeTime"].apply(_ms_to_iso)
+        elif "openTime" in out.columns:
+            out["event_time"] = out["openTime"].apply(_ms_to_iso)
+        else:
+            out["event_time"] = out["ingested_at"]
+
+        # Ensure required cols
+        if "symbol" not in out.columns:
+            out["symbol"] = pd.NA
+
+        # Keep ONLY what we want (plus: if Binance added new cols, you can keep them too)
+        # Here: keep FINAL_COLS only
+        frames.append(out)
+
+    # --- KLINES (list[list]) ---
+    if kl_mask.any():
+        dfk = df_env[kl_mask].copy()
+        dfk = dfk.explode("payload", ignore_index=True)
+
+        dfk["symbol"] = dfk.get("symbol", pd.NA)
+        dfk["price"] = dfk["payload"].apply(lambda k: k[4] if isinstance(k, list) and len(k) > 4 else None)
+        dfk["openTime"] = dfk["payload"].apply(lambda k: k[0] if isinstance(k, list) and len(k) > 0 else None)
+        dfk["event_time"] = dfk["openTime"].apply(_ms_to_iso)
+
+        # No ticker fields for klines, keep them as NA
+        for c in TICKER_COLS:
+            if c not in dfk.columns:
+                dfk[c] = pd.NA
+
+        dfk["lastPrice"] = pd.NA  # not applicable
+        frames.append(dfk)
+
+    if not frames:
+        return pd.DataFrame(columns=FINAL_COLS)
+
+    df_all = pd.concat(frames, ignore_index=True)
+
+    # If some ticker columns exist in df_all, great; otherwise they will be created in finalize
+    return _finalize_and_clean(df_all)
 
 
+# ------------------------
+# Kafka read
+# ------------------------
 def _read_kafka_batch(
     kafka_bootstrap: str,
     topic: str,
-    group_id: str,          # оставляем в сигнатуре, но не используем
-    poll_ms: int = 5000,
+    group_id: str,
     max_messages: int = 20000,
+    read_seconds: int = 30,
+    poll_timeout_ms: int = 1000,
 ) -> tuple[list[dict], KafkaConsumer]:
     consumer = KafkaConsumer(
+        topic,
         bootstrap_servers=[kafka_bootstrap],
+        group_id=group_id,
         enable_auto_commit=False,
         auto_offset_reset="earliest",
         value_deserializer=lambda v: json.loads(v.decode("utf-8")),
-        consumer_timeout_ms=2000,
-        api_version=(2, 6, 0),   # у тебя broker 2.6 (видно в логах)
+        max_poll_records=5000,
+        api_version=(2, 6),
     )
 
-    # вручную назначаем partition 0
-    tp = TopicPartition(topic, 0)
-    consumer.assign([tp])
-    consumer.seek_to_beginning(tp)
+    consumer.poll(timeout_ms=0)
 
     msgs: list[dict] = []
+    end_at = time.time() + read_seconds
+
     try:
-        records = consumer.poll(timeout_ms=poll_ms)
-        for _, batch in records.items():
-            for m in batch:
-                msgs.append(m.value)
-                if len(msgs) >= max_messages:
-                    break
+        while time.time() < end_at and len(msgs) < max_messages:
+            polled = consumer.poll(timeout_ms=poll_timeout_ms)
+            if not polled:
+                continue
+            for _tp, records in polled.items():
+                for r in records:
+                    msgs.append(r.value)
+                    if len(msgs) >= max_messages:
+                        break
     except Exception as e:
         print(f"[job2] kafka read error: {e}", flush=True)
 
     return msgs, consumer
 
+
+def _filter_existing_event_ids(df_events: pd.DataFrame, conn, events_table: str) -> pd.DataFrame:
+    if df_events.empty:
+        return df_events
+    existing = pd.read_sql_query(f"SELECT event_id FROM {events_table}", conn)
+    if existing.empty:
+        return df_events
+    return df_events[~df_events["event_id"].isin(existing["event_id"])]
+
+
+# ------------------------
+# Main entry
+# ------------------------
 def consume_clean_store_batch(
     kafka_bootstrap: str,
     topic: str,
@@ -129,9 +289,8 @@ def consume_clean_store_batch(
     sqlite_path: str,
     events_table: str = "events",
 ) -> None:
-    """
-    Job2: read Kafka -> clean with pandas -> write to SQLite(events)
-    """
+    Path(sqlite_path).parent.mkdir(parents=True, exist_ok=True)
+
     init_db(sqlite_path, events_table=events_table, summary_table="daily_summary")
 
     msgs, consumer = _read_kafka_batch(
@@ -140,36 +299,38 @@ def consume_clean_store_batch(
         group_id=group_id,
     )
 
+    print(f"[job2] fetched_msgs={len(msgs)} group_id={group_id}", flush=True)
+
     if not msgs:
-        print("[job2] no new messages in Kafka")
+        print("[job2] no new messages in Kafka", flush=True)
         consumer.close()
         return
 
-    # Build envelope DataFrame
     df_env = pd.DataFrame(msgs)
-
-    # Ensure required envelope cols exist
-    for col in ["event_id", "source", "ingested_at", "payload"]:
-        if col not in df_env.columns:
-            df_env[col] = pd.NA
-
     df_events = _extract_rows_from_envelope(df_env)
 
+    print(f"[job2] cleaned_rows={len(df_events)}", flush=True)
+
     if df_events.empty:
-        print("[job2] after cleaning, no valid rows to store")
+        print("[job2] after cleaning, no valid rows to store", flush=True)
         consumer.close()
         return
 
-    # Store to SQLite
     with sqlite_conn(sqlite_path) as conn:
-        # Using pandas to_sql is allowed; we avoid python loops
-        df_events.to_sql(events_table, conn, if_exists="append", index=False)
+        # Ensure events table has all FINAL_COLS columns
+        _ensure_columns_sqlite(conn, events_table, df_events[FINAL_COLS])
 
-    # Commit Kafka offsets ONLY after DB write succeeded
+        df_events = _filter_existing_event_ids(df_events, conn, events_table)
+        if df_events.empty:
+            print("[job2] all events already exist, nothing to insert", flush=True)
+            consumer.close()
+            return
+
+        df_events[FINAL_COLS].to_sql(events_table, conn, if_exists="append", index=False)
+
     try:
-        if consumer.config.get("group_id"):
-            consumer.commit()
+        consumer.commit()
     finally:
         consumer.close()
 
-    print(f"[job2] stored_rows={len(df_events)} into {sqlite_path}:{events_table}")
+    print(f"[job2] stored_rows={len(df_events)} into {sqlite_path}:{events_table}", flush=True)

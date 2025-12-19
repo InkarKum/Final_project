@@ -15,14 +15,11 @@ if SRC_PATH not in sys.path:
     sys.path.insert(0, SRC_PATH)
 
 
-# --- Config via env (safe for GitHub) ---
-API_URL = os.getenv("API_URL", "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT")
-KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
+API_URL = os.getenv("API_URL", "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT")
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:29092")
 KAFKA_TOPIC_RAW = os.getenv("KAFKA_TOPIC_RAW", "raw_events")
-
-# pseudo-stream loop settings
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))          # fetch every 60s
-RUN_SECONDS = int(os.getenv("RUN_SECONDS", "3600"))          # run for 1 hour per trigger
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
+RUN_SECONDS = int(os.getenv("RUN_SECONDS", "3600"))
 
 
 with DAG(
