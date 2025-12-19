@@ -27,6 +27,8 @@ project/
 │     └─ job3_daily_summary_dag.py
 │ ├─ airflow.cfg
 │ └─ simple_auth_manager_passwords
+├─ data/
+│ └─ app.db
 └─ Report final project.pdf
 ```
 
