@@ -1,20 +1,16 @@
 from __future__ import annotations
-
 from datetime import datetime, timezone, date, timedelta
 from typing import Optional
-
 import numpy as np
 import pandas as pd
-
 from db_utils import init_db, sqlite_conn
 
 
-def _utc_iso() -> str:
+def _utc_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def _recreate_daily_summary_schema(conn, summary_table: str) -> None:
-    # Полный rebuild: удаляем таблицу и создаём заново с нужными колонками
+def _recreate_daily_summary_schema(conn, summary_table: str):
     conn.execute(f"DROP TABLE IF EXISTS {summary_table}")
     conn.execute(
         f"""
@@ -63,28 +59,12 @@ def _recreate_daily_summary_schema(conn, summary_table: str) -> None:
 
 
 
-def rebuild_daily_summary(
-    sqlite_path: str,
-    events_table: str = "events",
-    summary_table: str = "daily_summary",
-    include_today: bool = True,
-    lookback_days: Optional[int] = None,
-) -> None:
-    """
-    Recomputes analytics for ALL days in scope and rebuilds daily_summary:
-      - DELETE FROM daily_summary
-      - INSERT freshly computed rows
-
-    include_today=True => includes current UTC day
-    lookback_days=None => uses full history present in events
-    """
+def rebuild_daily_summary(sqlite_path: str,events_table: str = "events",summary_table: str = "daily_summary",include_today: bool = True,lookback_days: Optional[int] = None,):
     init_db(sqlite_path, events_table=events_table, summary_table=summary_table)
     computed_at = _utc_iso()
 
     with sqlite_conn(sqlite_path) as conn:
         _recreate_daily_summary_schema(conn, summary_table)
-
-        # Determine time window
         if lookback_days is None:
             min_et, max_et = conn.execute(
                 f"SELECT MIN(event_time), MAX(event_time) FROM {events_table}"
@@ -101,7 +81,6 @@ def rebuild_daily_summary(
             end_day = date.today() if include_today else (date.today() - timedelta(days=1))
             start_day = end_day - timedelta(days=lookback_days - 1)
 
-        # Detect available columns
         cols_in_db = [r[1] for r in conn.execute(f"PRAGMA table_info({events_table})").fetchall()]
         want = [
             "symbol", "price", "event_time",
@@ -123,8 +102,6 @@ def rebuild_daily_summary(
             conn.execute(f"DELETE FROM {summary_table}")
             conn.commit()
             return
-
-        # Normalize types
         df["event_time"] = pd.to_datetime(df["event_time"], utc=True, errors="coerce")
         df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
         df["price"] = pd.to_numeric(df["price"], errors="coerce")
@@ -135,19 +112,13 @@ def rebuild_daily_summary(
         for c in ["volume", "quoteVolume", "count", "priceChange", "priceChangePercent", "bidPrice", "askPrice"]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
-
-        # Spread metrics (if bid/ask exist)
         if "bidPrice" in df.columns and "askPrice" in df.columns:
             df["spread"] = df["askPrice"] - df["bidPrice"]
             df["spread_pct"] = df["spread"] / df["price"]
         else:
             df["spread"] = np.nan
             df["spread_pct"] = np.nan
-
-        # Sort for OHLC/returns
         df = df.sort_values(["symbol", "day", "event_time"])
-
-        # Group and compute
         rows = []
         for (d, sym), g in df.groupby(["day", "symbol"], sort=False):
             g = g.sort_values("event_time")
@@ -186,7 +157,6 @@ def rebuild_daily_summary(
                 "computed_at": computed_at,
             }
 
-            # Optional aggregates
             if "volume" in g.columns:
                 out["avg_volume"] = float(g["volume"].mean())
                 out["sum_volume"] = float(g["volume"].sum())
@@ -221,11 +191,6 @@ def rebuild_daily_summary(
             rows.append(out)
 
         agg = pd.DataFrame(rows)
-
-        # Rebuild summary table
-        # conn.execute(f"DELETE FROM {summary_table}")
-        # conn.commit()
-
         agg.to_sql(summary_table, conn, if_exists="append", index=False)
 
     print(

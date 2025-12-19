@@ -1,9 +1,7 @@
 from __future__ import annotations
-
 import os
 import sys
 from datetime import timedelta
-
 import pendulum
 from airflow import DAG
 from airflow.decorators import task
@@ -35,8 +33,8 @@ with DAG(
             sqlite_path=SQLITE_PATH,
             events_table=EVENTS_TABLE,
             summary_table=SUMMARY_TABLE,
-            include_today=True,     # ✅ включаем today всегда
-            lookback_days=None,     # ✅ None = взять весь период из events
+            include_today=True,
+            lookback_days=None,
         )
 
     compute_daily_summary()

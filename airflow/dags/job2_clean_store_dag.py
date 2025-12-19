@@ -1,9 +1,7 @@
 from __future__ import annotations
-
 import os
 import sys
 from datetime import timedelta
-
 import pendulum
 from airflow import DAG
 from airflow.decorators import task
@@ -15,8 +13,7 @@ if SRC_PATH not in sys.path:
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:29092")
 KAFKA_TOPIC_RAW = os.getenv("KAFKA_TOPIC_RAW", "raw_events")
-KAFKA_GROUP_ID = "job2_debug_001"#os.getenv("KAFKA_GROUP_ID", "job2_cleaner_group")
-
+KAFKA_GROUP_ID = "job2_debug_001"
 SQLITE_PATH = os.getenv("SQLITE_PATH", "data/app.db")
 EVENTS_TABLE = os.getenv("EVENTS_TABLE", "events")
 
