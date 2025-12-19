@@ -12,6 +12,8 @@ This project implements a complete streaming and batch data pipeline using Apach
 ```
 project/
 │ README.md
+│ .gitignore
+│ docker-compose.yml
 │ requirements.txt
 ├─ src/
 │ ├─ job1_producer.py
@@ -20,12 +22,13 @@ project/
 │ └─ db_utils.py
 ├─ airflow/
 │ └─ dags/
-│ ├─ job1_ingestion_dag.py
-│ ├─ job2_clean_store_dag.py
-│ └─ job3_daily_summary_dag.py
+│     ├─ job1_ingestion_dag.py
+│     ├─ job2_clean_store_dag.py
+│     └─ job3_daily_summary_dag.py
+│ ├─ airflow.cfg
+│ └─ simple_auth_manager_passwords
 ├─ data/
 │ └─ app.db
-└─ report/
 └─ report.pdf
 ```
 
